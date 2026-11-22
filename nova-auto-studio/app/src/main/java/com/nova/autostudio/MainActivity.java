@@ -5,6 +5,8 @@ import android.os.Bundle;
 import android.content.Intent;
 import android.net.Uri;
 import android.graphics.*;
+import android.media.Image;
+import java.nio.ByteBuffer;
 import android.media.*;
 import android.os.*;
 import android.view.*;
@@ -66,6 +68,24 @@ public class MainActivity extends Activity {
       }
     }
   }
+  private void fillYuv420(Bitmap bitmap, Image image){
+    int width=bitmap.getWidth(),height=bitmap.getHeight();
+    int[] pixels=new int[width*height];bitmap.getPixels(pixels,0,width,0,0,width,height);
+    Image.Plane[] planes=image.getPlanes();
+    for(int p=0;p<3;p++){
+      ByteBuffer buffer=planes[p].getBuffer();
+      int rowStride=planes[p].getRowStride(),pixelStride=planes[p].getPixelStride();
+      int pw=p==0?width:width/2,ph=p==0?height:height/2;
+      for(int y=0;y<ph;y++)for(int x=0;x<pw;x++){
+        int pixel=pixels[(p==0?y:y*2)*width+(p==0?x:x*2)];
+        int r=(pixel>>16)&255,g=(pixel>>8)&255,b=pixel&255;
+        int value=p==0?((66*r+129*g+25*b+128)>>8)+16:
+          p==1?((-38*r-74*g+112*b+128)>>8)+128:
+          ((112*r-94*g-18*b+128)>>8)+128;
+        buffer.put(y*rowStride+x*pixelStride,(byte)Math.max(0,Math.min(255,value)));
+      }
+    }
+  }
   private void render(ArrayList<Uri> inputs,int aspect,File output)throws Exception{
     int width=aspect==0?720:aspect==1?1280:720;
     int height=aspect==0?1280:aspect==1?720:720;
@@ -84,6 +104,7 @@ public class MainActivity extends Activity {
       codec.start();MediaCodec.BufferInfo info=new MediaCodec.BufferInfo();
       Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
       long frameNumber=0;
+      long frameIndex=0;
       for(int idx=0;idx<inputs.size();idx++){
         BitmapFactory.Options opts=new BitmapFactory.Options();opts.inSampleSize=2;
         Bitmap bitmap;
@@ -91,43 +112,42 @@ public class MainActivity extends Activity {
         if(bitmap==null)throw new IOException("Unable to decode image "+idx);
         Bitmap frame=Bitmap.createBitmap(width,height,Bitmap.Config.ARGB_8888);
         Canvas canvas=new Canvas(frame);
-        int[] pixels=new int[width*height];
-        byte[] yuv=new byte[width*height*3/2];
         for(int f=0;f<framesPerImage;f++){
           canvas.drawColor(Color.BLACK);
           float scale=Math.max((float)width/bitmap.getWidth(),(float)height/bitmap.getHeight());
           scale*=1f+0.09f*f/framesPerImage;
           float w=bitmap.getWidth()*scale,h=bitmap.getHeight()*scale;
-          float dx=(width-w)/2f,dy=(height-h)/2f;
-          canvas.drawBitmap(bitmap,null,new RectF(dx,dy,dx+w,dy+h),paint);
-          frame.getPixels(pixels,0,width,0,0,width,height);
-          rgbaToNV12(pixels,yuv,width,height);
-          int inIndex=codec.dequeueInputBuffer(1000000);
-          if(inIndex<0)throw new IOException("Encoder input timeout");
-          java.nio.ByteBuffer inBuf=codec.getInputBuffer(inIndex);
-          inBuf.clear();inBuf.put(yuv);
-          codec.queueInputBuffer(inIndex,0,yuv.length,frameNumber*1000000L/fps,0);
-          frameNumber++;
-          int out;
-          while((out=codec.dequeueOutputBuffer(info,0))>=0 || out==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED){
+          canvas.drawBitmap(bitmap,null,new RectF((width-w)/2f,(height-h)/2f,(width+w)/2f,(height+h)/2f),paint);
+          int inputIndex=codec.dequeueInputBuffer(2000000);
+          if(inputIndex<0)throw new IOException("Encoder input timeout");
+          Image image=codec.getInputImage(inputIndex);
+          if(image==null)throw new IOException("Encoder YUV input unavailable");
+          fillYuv420(frame,image);
+          image.close();
+          codec.queueInputBuffer(inputIndex,0,width*height*3/2,frameIndex*1000000L/fps,0);
+          frameIndex++;
+          boolean draining=true;
+          while(draining){
+            int out=codec.dequeueOutputBuffer(info,1000);
             if(out==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED){track=muxer.addTrack(codec.getOutputFormat());muxer.start();started=true;}
-            else {java.nio.ByteBuffer buf=codec.getOutputBuffer(out);
+            else if(out>=0){
+              ByteBuffer buf=codec.getOutputBuffer(out);
               if((info.flags&MediaCodec.BUFFER_FLAG_CODEC_CONFIG)==0&&info.size>0&&started){buf.position(info.offset);buf.limit(info.offset+info.size);muxer.writeSampleData(track,buf,info);}
               codec.releaseOutputBuffer(out,false);
-            }
+            }else draining=false;
           }
         }
         frame.recycle();bitmap.recycle();
       }
-      int eos=codec.dequeueInputBuffer(1000000);
+      int eos=codec.dequeueInputBuffer(2000000);
       if(eos<0)throw new IOException("Encoder EOS timeout");
-      codec.queueInputBuffer(eos,0,0,frameNumber*1000000L/fps,MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+      codec.queueInputBuffer(eos,0,0,frameIndex*1000000L/fps,MediaCodec.BUFFER_FLAG_END_OF_STREAM);
       boolean done=false;int loops=0;
       while(!done&&loops++<2000){
         int out=codec.dequeueOutputBuffer(info,10000);
         if(out==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED){if(!started){track=muxer.addTrack(codec.getOutputFormat());muxer.start();started=true;}}
         else if(out>=0){
-          java.nio.ByteBuffer buf=codec.getOutputBuffer(out);
+          ByteBuffer buf=codec.getOutputBuffer(out);
           if((info.flags&MediaCodec.BUFFER_FLAG_CODEC_CONFIG)==0&&info.size>0&&started){buf.position(info.offset);buf.limit(info.offset+info.size);muxer.writeSampleData(track,buf,info);}
           done=(info.flags&MediaCodec.BUFFER_FLAG_END_OF_STREAM)!=0;
           codec.releaseOutputBuffer(out,false);
