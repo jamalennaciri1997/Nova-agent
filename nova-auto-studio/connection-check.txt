@@ -1,0 +1,1 @@
+NOVA Auto Studio GitHub write permission check.
